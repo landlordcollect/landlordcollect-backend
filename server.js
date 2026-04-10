@@ -1,197 +1,228 @@
 /**
  * LandlordCollect — Backend Server
- * Node.js + Express + Stripe
+ * Node.js + Express + Stripe + Supabase
  *
  * Setup:
- *   npm install express stripe cors dotenv
- *   Create a .env file with your Stripe keys (see below)
+ *   npm install express stripe cors dotenv @supabase/supabase-js
+ *   Create a .env file with your keys (see bottom of file)
  *   node server.js
  */
 
 require("dotenv").config();
-const express = require("express");
-const cors    = require("cors");
-const stripe  = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const express   = require("express");
+const cors      = require("cors");
+const stripe    = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: "https://landlordcollect.com" })); // Lock to your domain
+// Supabase admin client (uses service role key — never expose this publicly)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+// ── Middleware ────────────────────────────────────────────────────────────────
+app.use(cors({ origin: "https://landlordcollect.com" }));
 app.use(express.json());
 
 // Stripe webhooks need raw body — mount BEFORE express.json()
-app.post(
-  "/api/webhook",
-  express.raw({ type: "application/json" }),
-  handleWebhook
-);
+app.post("/api/webhook", express.raw({ type: "application/json" }), handleWebhook);
 
-// ─── In-memory tenant DB (replace with a real DB like Postgres/MongoDB) ──────
-const tenants = {
-  "marcus_1a": { name: "Marcus Johnson",  unit: "1A", rent: 185000, status: "late",    email: "marcus@email.com" },
-  "sofia_1b":  { name: "Sofia Reyes",     unit: "1B", rent: 210000, status: "late",    email: "sofia@email.com"  },
-  "david_2a":  { name: "David Kim",       unit: "2A", rent: 165000, status: "paid",    email: "david@email.com"  },
-  "priya_2b":  { name: "Priya Patel",     unit: "2B", rent: 195000, status: "pending", email: "priya@email.com"  },
-  "james_3a":  { name: "James Wilson",    unit: "3A", rent: 225000, status: "late",    email: "james@email.com"  },
-};
+// ── Routes ────────────────────────────────────────────────────────────────────
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+/**
+ * GET /api/health
+ * Health check endpoint
+ */
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
 
 /**
  * GET /api/tenant/:tenantId
  * Returns tenant info for the payment page
- * Called when tenant opens their payment link
  */
-app.get("/api/tenant/:tenantId", (req, res) => {
-  const tenant = tenants[req.params.tenantId];
-  if (!tenant) return res.status(404).json({ error: "Tenant not found" });
+app.get("/api/tenant/:tenantId", async (req, res) => {
+  const { data, error } = await supabase
+    .from("tenants")
+    .select("*")
+    .eq("id", req.params.tenantId)
+    .single();
 
-  // Don't expose internal fields — return only what the page needs
-  res.json({
-    name:    tenant.name,
-    unit:    tenant.unit,
-    rent:    tenant.rent,       // in cents
-    status:  tenant.status,
-    email:   tenant.email,
-    lateFee: tenant.status === "late" ? 5000 : 0, // $50 late fee in cents
-  });
+  if (error || !data) return res.status(404).json({ error: "Tenant not found" });
+  res.json(data);
 });
 
 /**
  * POST /api/create-payment-intent
- * Creates a Stripe PaymentIntent and returns the client secret
- * Called when tenant clicks "Pay Now"
+ * Creates a Stripe PaymentIntent for tenant rent payment
  */
 app.post("/api/create-payment-intent", async (req, res) => {
   const { tenantId, paymentMethodId } = req.body;
 
-  const tenant = tenants[tenantId];
-  if (!tenant) return res.status(404).json({ error: "Tenant not found" });
+  const { data: tenant } = await supabase
+    .from("tenants")
+    .select("*")
+    .eq("id", tenantId)
+    .single();
 
-  if (tenant.status === "paid") {
-    return res.status(400).json({ error: "This tenant has already paid." });
-  }
+  if (!tenant) return res.status(404).json({ error: "Tenant not found" });
 
   const lateFee = tenant.status === "late" ? 5000 : 0;
   const total   = tenant.rent + lateFee;
 
   try {
     const paymentIntent = await stripe.paymentIntents.create({
-      amount:               total,
-      currency:             "usd",
-      payment_method:       paymentMethodId,
-      confirm:              true,            // Confirm immediately
+      amount:         total,
+      currency:       "usd",
+      payment_method: paymentMethodId,
+      confirm:        true,
       automatic_payment_methods: { enabled: true, allow_redirects: "never" },
-      receipt_email:        tenant.email,
-      metadata: {
-        tenantId,
-        tenantName: tenant.name,
-        unit:       tenant.unit,
-        period:     "April 2026",
-      },
-      description: `Rent – Unit ${tenant.unit} – April 2026`,
+      receipt_email:  tenant.email,
+      metadata: { tenantId, tenantName: tenant.name, unit: tenant.unit },
+      description: `Rent – Unit ${tenant.unit}`,
     });
 
-    res.json({
-      success:      true,
-      clientSecret: paymentIntent.client_secret,
-      transactionId: paymentIntent.id,
-    });
-
+    res.json({ success: true, transactionId: paymentIntent.id });
   } catch (err) {
-    console.error("Stripe error:", err.message);
     res.status(400).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/send-reminder/:tenantId
- * Sends a payment reminder email via Stripe (or your email provider)
- * Called from the landlord dashboard "Remind" button
- */
-app.post("/api/send-reminder/:tenantId", async (req, res) => {
-  const tenant = tenants[req.params.tenantId];
-  if (!tenant) return res.status(404).json({ error: "Tenant not found" });
+// ── Stripe Webhook Handler ────────────────────────────────────────────────────
 
-  // In production: use SendGrid, Resend, or Postmark here
-  // Example with a hypothetical emailService:
-  //
-  // await emailService.send({
-  //   to:      tenant.email,
-  //   subject: `Reminder: Rent Due – Unit ${tenant.unit}`,
-  //   html:    `<p>Hi ${tenant.name}, your rent of $${tenant.rent / 100} is due...</p>
-  //             <a href="https://landlordcollect.com/pay?tenant=${req.params.tenantId}">Pay Now</a>`
-  // });
-
-  console.log(`Reminder sent to ${tenant.email} for unit ${tenant.unit}`);
-  res.json({ success: true, message: `Reminder sent to ${tenant.email}` });
-});
-
-/**
- * GET /api/dashboard
- * Returns aggregated stats for the landlord dashboard
- */
-app.get("/api/dashboard", (req, res) => {
-  const all = Object.entries(tenants).map(([id, t]) => ({ id, ...t }));
-
-  const stats = {
-    totalExpected:  all.reduce((s, t) => s + t.rent, 0),
-    collected:      all.filter(t => t.status === "paid").reduce((s, t) => s + t.rent, 0),
-    outstanding:    all.filter(t => t.status !== "paid").reduce((s, t) => s + t.rent, 0),
-    paidCount:      all.filter(t => t.status === "paid").length,
-    lateCount:      all.filter(t => t.status === "late").length,
-    pendingCount:   all.filter(t => t.status === "pending").length,
-    tenants:        all,
-  };
-
-  res.json(stats);
-});
-
-// ─── Stripe Webhook Handler ───────────────────────────────────────────────────
-
-/**
- * POST /api/webhook
- * Stripe sends events here after payments complete
- * Marks tenants as paid automatically
- *
- * In Stripe Dashboard → Developers → Webhooks:
- *   Add endpoint: https://landlordcollect.com/api/webhook
- *   Listen for:   payment_intent.succeeded
- *                 payment_intent.payment_failed
- */
 async function handleWebhook(req, res) {
   const sig = req.headers["stripe-signature"];
-
   let event;
+
   try {
     event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
+      req.body, sig, process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
     console.error("Webhook signature failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  switch (event.type) {
-    case "payment_intent.succeeded": {
-      const intent   = event.data.object;
-      const tenantId = intent.metadata.tenantId;
+  console.log(`Stripe event: ${event.type}`);
 
-      if (tenants[tenantId]) {
-        tenants[tenantId].status = "paid";
-        console.log(`✅ Payment confirmed for ${tenants[tenantId].name} (${tenantId})`);
-        // In production: update your database here
-        // await db.tenants.update({ id: tenantId }, { status: 'paid', paidAt: new Date() });
+  switch (event.type) {
+
+    // ── New subscription created ──────────────────────────────────────────────
+    case "customer.subscription.created": {
+      const subscription = event.data.object;
+      const customerId   = subscription.customer;
+
+      try {
+        // Get customer details from Stripe
+        const customer = await stripe.customers.retrieve(customerId);
+        const email    = customer.email;
+        const name     = customer.name || email.split("@")[0];
+
+        // Get plan name from subscription
+        const priceId  = subscription.items.data[0]?.price?.id;
+        const planName = getPlanName(priceId);
+
+        console.log(`New subscriber: ${email} on ${planName}`);
+
+        // Create Supabase account for this customer
+        const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+          email,
+          password:      generateTempPassword(),
+          email_confirm: true,
+          user_metadata: {
+            full_name:       name,
+            plan:            planName,
+            stripe_customer: customerId,
+            subscription_id: subscription.id,
+          }
+        });
+
+        if (authError) {
+          // User might already exist — try to get them
+          console.log("User may already exist:", authError.message);
+        }
+
+        // Send password reset email so they can set their own password
+        await supabase.auth.admin.generateLink({
+          type:       "magiclink",
+          email,
+          options: { redirectTo: "https://landlordcollect.com/dashboard.html" }
+        });
+
+        // Send welcome email via Supabase
+        console.log(`✅ Account created for ${email} on ${planName} plan`);
+
+        // Save customer record to database
+        await supabase.from("subscribers").upsert({
+          email,
+          name,
+          plan:            planName,
+          stripe_customer: customerId,
+          subscription_id: subscription.id,
+          status:          "trialing",
+          trial_end:       new Date(subscription.trial_end * 1000).toISOString(),
+          created_at:      new Date().toISOString(),
+        });
+
+      } catch (err) {
+        console.error("Error creating user:", err.message);
       }
       break;
     }
 
+    // ── Subscription activated (trial ended, now paying) ─────────────────────
+    case "customer.subscription.updated": {
+      const subscription = event.data.object;
+      const status       = subscription.status;
+
+      await supabase.from("subscribers")
+        .update({ status })
+        .eq("subscription_id", subscription.id);
+
+      console.log(`Subscription ${subscription.id} updated to ${status}`);
+      break;
+    }
+
+    // ── Subscription cancelled ────────────────────────────────────────────────
+    case "customer.subscription.deleted": {
+      const subscription = event.data.object;
+
+      await supabase.from("subscribers")
+        .update({ status: "cancelled" })
+        .eq("subscription_id", subscription.id);
+
+      console.log(`Subscription ${subscription.id} cancelled`);
+      break;
+    }
+
+    // ── Tenant rent payment succeeded ─────────────────────────────────────────
+    case "payment_intent.succeeded": {
+      const intent   = event.data.object;
+      const tenantId = intent.metadata?.tenantId;
+
+      if (tenantId) {
+        await supabase.from("tenants")
+          .update({ status: "paid", paid_at: new Date().toISOString() })
+          .eq("id", tenantId);
+
+        console.log(`✅ Rent payment confirmed for tenant ${tenantId}`);
+      }
+      break;
+    }
+
+    // ── Payment failed ────────────────────────────────────────────────────────
     case "payment_intent.payment_failed": {
       const intent   = event.data.object;
-      const tenantId = intent.metadata.tenantId;
-      console.log(`❌ Payment failed for tenant ${tenantId}:`, intent.last_payment_error?.message);
+      const tenantId = intent.metadata?.tenantId;
+
+      if (tenantId) {
+        await supabase.from("tenants")
+          .update({ status: "late" })
+          .eq("id", tenantId);
+      }
+      console.log(`❌ Payment failed for tenant ${tenantId}`);
       break;
     }
 
@@ -202,21 +233,40 @@ async function handleWebhook(req, res) {
   res.json({ received: true });
 }
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function getPlanName(priceId) {
+  const plans = {
+    "price_UILraXmxb6aC8Y": "Starter",
+    "price_UILt7w7WGK8fZB": "Pro",
+    "price_UILuPNEbggy2kF": "Portfolio",
+  };
+  return plans[priceId] || "Starter";
+}
+
+function generateTempPassword() {
+  return Math.random().toString(36).slice(2, 10) +
+         Math.random().toString(36).slice(2, 10).toUpperCase() + "!1";
+}
+
+// ── Start Server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n🏠 LandlordCollect API running on port ${PORT}`);
-  console.log(`   Stripe mode: ${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "LIVE 🟢" : "TEST 🟡"}\n`);
+  console.log(`   Stripe: ${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "LIVE 🟢" : "TEST 🟡"}`);
+  console.log(`   Supabase: ${process.env.SUPABASE_URL}\n`);
 });
 
 /**
- * ─── .env file (create this in your project root) ──────────────────────────
+ * ── .env file ──────────────────────────────────────────────────────────────
  *
- * STRIPE_SECRET_KEY=sk_test_YOUR_SECRET_KEY_HERE
- * STRIPE_WEBHOOK_SECRET=whsec_YOUR_WEBHOOK_SECRET_HERE
+ * STRIPE_SECRET_KEY=sk_live_YOUR_KEY
+ * STRIPE_WEBHOOK_SECRET=whsec_YOUR_KEY
+ * SUPABASE_URL=https://uogaehexqnisestkpshu.supabase.co
+ * SUPABASE_SERVICE_KEY=your_service_role_key_here
  * PORT=3001
  *
- * Get your keys at: https://dashboard.stripe.com/apikeys
- * Get webhook secret at: https://dashboard.stripe.com/webhooks
- * ───────────────────────────────────────────────────────────────────────────
+ * Get Supabase service key at:
+ * supabase.com → your project → Settings → API → service_role key
+ * ────────────────────────────────────────────────────────────────────────────
  */
