@@ -13,6 +13,8 @@ const express   = require("express");
 const cors      = require("cors");
 const stripe    = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require("@supabase/supabase-js");
+const { Resend } = require("resend");
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const app = express();
 
@@ -37,6 +39,86 @@ app.post("/api/webhook", express.raw({ type: "application/json" }), handleWebhoo
  */
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+/**
+ * POST /api/send-payment-link
+ * Sends a payment link email to a tenant
+ */
+app.post("/api/send-payment-link", async (req, res) => {
+  const { tenantName, tenantEmail, unit, rent, paymentLink } = req.body;
+  if (!tenantEmail) return res.status(400).json({ error: "Tenant email required" });
+
+  try {
+    await resend.emails.send({
+      from:    "LandlordCollect <hello@landlordcollect.com>",
+      to:      tenantEmail,
+      subject: `Your Rent Payment Link - Unit ${unit}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:40px 20px;">
+          <div style="background:#0c1013;padding:24px;border-radius:12px;text-align:center;margin-bottom:24px;">
+            <h1 style="color:#22d3a0;margin:0;font-size:24px;">🏠 LandlordCollect</h1>
+          </div>
+          <h2 style="color:#1a1a1a;">Hi ${tenantName},</h2>
+          <p style="color:#555;line-height:1.6;">Your rent payment of <strong>$${rent}</strong> for Unit <strong>${unit}</strong> is ready to pay online.</p>
+          <div style="text-align:center;margin:32px 0;">
+            <a href="${paymentLink}" 
+               style="background:#22d3a0;color:#0c1013;padding:16px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
+              Pay Rent Now →
+            </a>
+          </div>
+          <p style="color:#999;font-size:13px;text-align:center;">
+            Or copy this link: <a href="${paymentLink}" style="color:#22d3a0;">${paymentLink}</a>
+          </p>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0;">
+          <p style="color:#999;font-size:12px;text-align:center;">
+            Powered by LandlordCollect · landlordcollect.com
+          </p>
+        </div>`,
+    });
+
+    res.json({ success: true, message: `Payment link sent to ${tenantEmail}` });
+  } catch (err) {
+    console.error("Email error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/send-reminder/:tenantId
+ * Sends a payment reminder email
+ */
+app.post("/api/send-reminder/:tenantId", async (req, res) => {
+  const { tenantName, tenantEmail, unit, rent, paymentLink } = req.body;
+  if (!tenantEmail) return res.status(400).json({ error: "Tenant email required" });
+
+  try {
+    await resend.emails.send({
+      from:    "LandlordCollect <hello@landlordcollect.com>",
+      to:      tenantEmail,
+      subject: `Reminder: Rent Payment Due - Unit ${unit}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:40px 20px;">
+          <div style="background:#0c1013;padding:24px;border-radius:12px;text-align:center;margin-bottom:24px;">
+            <h1 style="color:#22d3a0;margin:0;font-size:24px;">🏠 LandlordCollect</h1>
+          </div>
+          <h2 style="color:#1a1a1a;">Reminder: Rent Due Soon</h2>
+          <p style="color:#555;line-height:1.6;">Hi ${tenantName}, this is a friendly reminder that your rent payment of <strong>$${rent}</strong> for Unit <strong>${unit}</strong> is due.</p>
+          <div style="text-align:center;margin:32px 0;">
+            <a href="${paymentLink}"
+               style="background:#f59e0b;color:#0c1013;padding:16px 32px;border-radius:10px;text-decoration:none;font-weight:700;font-size:16px;display:inline-block;">
+              Pay Now →
+            </a>
+          </div>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0;">
+          <p style="color:#999;font-size:12px;text-align:center;">Powered by LandlordCollect · landlordcollect.com</p>
+        </div>`,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /**
